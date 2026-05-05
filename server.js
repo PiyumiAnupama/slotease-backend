@@ -11,11 +11,15 @@ connectDB();
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: 'http://localhost:3001', // React default port
+  credentials: true
+}));
 app.use(express.json());
 app.use('/api/businesses', businessRoutes);
 app.use('/api/services', serviceRoutes);
 app.use('/api/appointments', appointmentRoutes);
+
 
 // Routes
 const authRoutes = require('./routes/authRoutes');
