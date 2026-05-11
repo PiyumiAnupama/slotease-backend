@@ -4,30 +4,24 @@ const Appointment = require('../models/Appointment');
 const Service = require('../models/Service');
 const Business = require('../models/Business');
 const { protect, restrictTo } = require('../middleware/authMiddleware');
-const { body, validationResult } = require('express-validator');
 
 // Helper function to calculate end time
-const calculateEndTime = (startTime, durationMinutes) => {
+const calculateEndTime = (startTime, duration) => {
   const [hours, minutes] = startTime.split(':').map(Number);
-  const totalMinutes = hours * 60 + minutes + durationMinutes;
-  const endHours = Math.floor(totalMinutes / 60) % 24;
+  const totalMinutes = hours * 60 + minutes + duration;
+  const endHours = Math.floor(totalMinutes / 60);
   const endMinutes = totalMinutes % 60;
   return `${String(endHours).padStart(2, '0')}:${String(endMinutes).padStart(2, '0')}`;
 };
 
-// Check if time slot is available
+// Helper function to check if time slot is available
 const isTimeSlotAvailable = async (businessId, date, startTime, endTime, excludeAppointmentId = null) => {
   const query = {
     business: businessId,
     appointmentDate: date,
     status: { $in: ['pending', 'confirmed'] },
     $or: [
-      {
-        $and: [
-          { startTime: { $lt: endTime } },
-          { endTime: { $gt: startTime } }
-        ]
-      }
+      { startTime: { $lt: endTime }, endTime: { $gt: startTime } }
     ]
   };
 
@@ -35,213 +29,320 @@ const isTimeSlotAvailable = async (businessId, date, startTime, endTime, exclude
     query._id = { $ne: excludeAppointmentId };
   }
 
-  const conflictingAppointment = await Appointment.findOne(query);
-  return !conflictingAppointment;
+  const conflictingAppointments = await Appointment.find(query);
+  return conflictingAppointments.length === 0;
 };
 
-// Create a new appointment (customers only)
-router.post('/',
-  protect,
-  [
-    body('service').notEmpty().withMessage('Service ID is required'),
-    body('appointmentDate').isISO8601().withMessage('Valid appointment date is required'),
-    body('startTime').matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).withMessage('Valid start time is required (HH:MM)'),
-    body('customerName').notEmpty().withMessage('Customer name is required'),
-    body('customerEmail').isEmail().withMessage('Valid customer email is required'),
-    body('customerPhone').notEmpty().withMessage('Customer phone is required')
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+// @route   POST /api/appointments
+// @desc    Create new appointment
+// @access  Private (Customer)
+router.post('/', protect, async (req, res) => {
+  try {
+    const { service: serviceId, appointmentDate, startTime, customerName, customerEmail, customerPhone, notes } = req.body;
+
+    console.log('=== CREATE APPOINTMENT REQUEST ===');
+    console.log('User ID:', req.user._id);
+    console.log('User Email:', req.user.email);
+    console.log('User Role:', req.user.role);
+    console.log('Request body:', req.body);
+
+    // Get service details
+    const service = await Service.findById(serviceId).populate('business');
+    if (!service) {
+      return res.status(404).json({ message: 'Service not found' });
     }
 
-    try {
-      const { service: serviceId, appointmentDate, startTime, customerName, customerEmail, customerPhone, notes } = req.body;
+    console.log('Service found:', service.name);
+    console.log('Business:', service.business.name);
 
-      // Get service details
-      const service = await Service.findById(serviceId).populate('business');
-      if (!service) {
-        return res.status(404).json({ message: 'Service not found' });
-      }
+    // Calculate end time
+    const endTime = calculateEndTime(startTime, service.duration);
+    console.log('Time slot:', startTime, '-', endTime);
 
-      if (!service.isActive) {
-        return res.status(400).json({ message: 'This service is not available' });
-      }
-
-      // Calculate end time based on service duration
-      const endTime = calculateEndTime(startTime, service.duration);
-
-      // Check if business is open on that day
-     const appointmentDay = new Date(appointmentDate).toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
-      const businessHours = service.business.operatingHours[appointmentDay];
-      
-      if (!businessHours || businessHours.open === 'Closed') {
-        return res.status(400).json({ message: `Business is closed on ${appointmentDay}s` });
-      }
-
-      // Check if requested time is within business hours
-      if (startTime < businessHours.open || endTime > businessHours.close) {
-        return res.status(400).json({ 
-          message: `Business hours are ${businessHours.open} - ${businessHours.close}` 
-        });
-      }
-
-      // Check if time slot is available
-      const available = await isTimeSlotAvailable(service.business._id, appointmentDate, startTime, endTime);
-      if (!available) {
-        return res.status(400).json({ message: 'This time slot is not available' });
-      }
-
-      // Create appointment
-      const appointment = await Appointment.create({
-        business: service.business._id,
-        service: serviceId,
-        customer: req.user._id,
-        appointmentDate,
-        startTime,
-        endTime,
-        customerName,
-        customerEmail,
-        customerPhone,
-        notes,
-        totalPrice: service.price,
-        currency: service.currency
-      });
-
-      const populatedAppointment = await Appointment.findById(appointment._id)
-        .populate('business', 'name contactEmail contactPhone')
-        .populate('service', 'name duration price')
-        .populate('customer', 'name email');
-
-      res.status(201).json({
-        message: 'Appointment created successfully',
-        appointment: populatedAppointment
-      });
-    } catch (error) {
-      res.status(500).json({ message: error.message });
+    // Check if business is open on this day
+    const appointmentDay = new Date(appointmentDate).toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+    const businessHours = service.business.operatingHours[appointmentDay];
+    
+    if (!businessHours || businessHours.open === 'Closed') {
+      return res.status(400).json({ message: `Business is closed on ${appointmentDay}` });
     }
+
+    // Validate time is within business hours
+    if (startTime < businessHours.open || endTime > businessHours.close) {
+      return res.status(400).json({ 
+        message: `Please select a time between ${businessHours.open} and ${businessHours.close}` 
+      });
+    }
+
+    // Check for conflicts
+    const isAvailable = await isTimeSlotAvailable(service.business._id, appointmentDate, startTime, endTime);
+    if (!isAvailable) {
+      return res.status(400).json({ message: 'This time slot is already booked' });
+    }
+
+    // Create appointment
+    const appointment = await Appointment.create({
+      business: service.business._id,
+      service: serviceId,
+      customer: req.user._id,
+      appointmentDate,
+      startTime,
+      endTime,
+      customerName,
+      customerEmail,
+      customerPhone,
+      notes,
+      totalPrice: service.price,
+      currency: service.currency,
+      status: 'pending'
+    });
+
+    console.log('=== APPOINTMENT CREATED SUCCESSFULLY ===');
+    console.log('Appointment ID:', appointment._id);
+    console.log('Customer ID saved:', appointment.customer);
+    console.log('Status:', appointment.status);
+    console.log('Full appointment object:', JSON.stringify(appointment, null, 2));
+
+    // Populate before sending response
+    await appointment.populate('service business customer');
+
+    res.status(201).json({
+      success: true,
+      message: 'Appointment created successfully',
+      appointment
+    });
+  } catch (error) {
+    console.error('=== ERROR CREATING APPOINTMENT ===');
+    console.error('Error:', error);
+    console.error('Stack:', error.stack);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
-);
+});
 
-// Get all appointments (with filters)
+// @route   GET /api/appointments
+// @desc    Get appointments based on user role
+// @access  Private
 router.get('/', protect, async (req, res) => {
   try {
+    console.log('=== GET APPOINTMENTS REQUEST ===');
+    console.log('User ID:', req.user._id);
+    console.log('User ID Type:', typeof req.user._id);
+    console.log('User Email:', req.user.email);
+    console.log('User Role:', req.user.role);
+
     let query = {};
 
-    // If customer, show only their appointments
     if (req.user.role === 'customer') {
+      // Customer sees their own appointments
       query.customer = req.user._id;
-    }
-
-    // If business owner, show appointments for their businesses
-    if (req.user.role === 'business_owner') {
+      console.log('Customer query:', JSON.stringify(query));
+      console.log('Looking for appointments with customer ID:', req.user._id.toString());
+    } else if (req.user.role === 'business_owner') {
+      // Business owner sees appointments for their businesses
       const businesses = await Business.find({ owner: req.user._id });
       const businessIds = businesses.map(b => b._id);
       query.business = { $in: businessIds };
+      console.log('Business owner query:', JSON.stringify(query));
+      console.log('Business IDs:', businessIds);
+    } else if (req.user.role === 'admin') {
+      // Admin sees all appointments
+      console.log('Admin - fetching all appointments');
     }
 
+    console.log('Executing query:', JSON.stringify(query));
+
     const appointments = await Appointment.find(query)
-      .populate('business', 'name contactEmail contactPhone')
-      .populate('service', 'name duration price')
+      .populate('service', 'name duration price currency')
+      .populate('business', 'name contactPhone address')
       .populate('customer', 'name email')
-      .sort({ appointmentDate: 1, startTime: 1 });
+      .sort({ appointmentDate: -1, startTime: -1 })
+      .lean();
+
+    console.log('=== APPOINTMENTS FOUND ===');
+    console.log('Count:', appointments.length);
+    
+    if (appointments.length > 0) {
+      console.log('First appointment sample:');
+      console.log('  ID:', appointments[0]._id);
+      console.log('  Customer ID:', appointments[0].customer?._id || appointments[0].customer);
+      console.log('  Service:', appointments[0].service?.name);
+      console.log('  Status:', appointments[0].status);
+    } else {
+      console.log('NO APPOINTMENTS FOUND - Query returned empty array');
+    }
 
     res.json({
+      success: true,
       count: appointments.length,
       appointments
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('=== ERROR FETCHING APPOINTMENTS ===');
+    console.error('Error:', error);
+    console.error('Stack:', error.stack);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
 
-// Get single appointment
+// @route   GET /api/appointments/test/mine
+// @desc    TEST - Check what appointments exist for this user
+// @access  Private
+router.get('/test/mine', protect, async (req, res) => {
+  try {
+    console.log('=== TEST ENDPOINT - CHECKING USER APPOINTMENTS ===');
+    console.log('Logged in user ID:', req.user._id);
+    console.log('Logged in user role:', req.user.role);
+
+    // Get ALL appointments without any filter
+    const allAppointments = await Appointment.find({}).lean();
+    
+    console.log('Total appointments in database:', allAppointments.length);
+
+    // Manually check which ones belong to this user
+    const myAppointments = allAppointments.filter(apt => {
+      const customerIdString = apt.customer ? apt.customer.toString() : null;
+      const userIdString = req.user._id.toString();
+      const matches = customerIdString === userIdString;
+      
+      console.log(`Appointment ${apt._id}: customer=${customerIdString}, matches=${matches}`);
+      
+      return matches;
+    });
+
+    res.json({
+      success: true,
+      debug: {
+        userId: req.user._id.toString(),
+        userRole: req.user.role,
+        totalAppointmentsInDB: allAppointments.length,
+        myAppointmentsCount: myAppointments.length
+      },
+      myAppointments: myAppointments,
+      allAppointmentsSample: allAppointments.slice(0, 3).map(a => ({
+        id: a._id,
+        customerId: a.customer,
+        customerIdType: typeof a.customer,
+        matchesUser: a.customer && a.customer.toString() === req.user._id.toString(),
+        date: a.appointmentDate,
+        status: a.status
+      }))
+    });
+  } catch (error) {
+    console.error('Test endpoint error:', error);
+    res.status(500).json({ error: error.message, stack: error.stack });
+  }
+});
+
+// @route   GET /api/appointments/debug/all
+// @desc    DEBUG - Get ALL appointments (temporary)
+// @access  Private
+router.get('/debug/all', protect, async (req, res) => {
+  try {
+    const allAppointments = await Appointment.find({})
+      .populate('service business customer')
+      .lean();
+    
+    res.json({
+      total: allAppointments.length,
+      userRole: req.user.role,
+      userId: req.user._id,
+      appointments: allAppointments
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// @route   GET /api/appointments/:id
+// @desc    Get single appointment
+// @access  Private
 router.get('/:id', protect, async (req, res) => {
   try {
     const appointment = await Appointment.findById(req.params.id)
-      .populate('business', 'name description contactEmail contactPhone address')
-      .populate('service', 'name description duration price')
+      .populate('service')
+      .populate('business')
       .populate('customer', 'name email');
 
     if (!appointment) {
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
-    // Check access rights
+    // Check authorization
     const isCustomer = appointment.customer._id.toString() === req.user._id.toString();
-    const isBusinessOwner = await Business.findOne({ 
-      _id: appointment.business._id, 
-      owner: req.user._id 
-    });
+    const business = await Business.findById(appointment.business._id);
+    const isOwner = business.owner.toString() === req.user._id.toString();
     const isAdmin = req.user.role === 'admin';
 
-    if (!isCustomer && !isBusinessOwner && !isAdmin) {
-      return res.status(403).json({ message: 'Access denied' });
+    if (!isCustomer && !isOwner && !isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to view this appointment' });
     }
 
-    res.json({ appointment });
+    res.json({ success: true, appointment });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching appointment:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
 
-// Update appointment status (business owner or admin)
-router.patch('/:id/status',
-  protect,
-  restrictTo('business_owner', 'admin'),
-  [
-    body('status').isIn(['pending', 'confirmed', 'completed', 'cancelled'])
-      .withMessage('Invalid status')
-  ],
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
-    try {
-      const appointment = await Appointment.findById(req.params.id).populate('business');
-
-      if (!appointment) {
-        return res.status(404).json({ message: 'Appointment not found' });
-      }
-
-      // Check ownership
-      const isOwner = appointment.business.owner.toString() === req.user._id.toString();
-      if (!isOwner && req.user.role !== 'admin') {
-        return res.status(403).json({ message: 'Access denied' });
-      }
-
-      appointment.status = req.body.status;
-      await appointment.save();
-
-      res.json({
-        message: 'Appointment status updated',
-        appointment
-      });
-    } catch (error) {
-      res.status(500).json({ message: error.message });
-    }
-  }
-);
-
-// Cancel appointment (customer can cancel their own)
-router.patch('/:id/cancel', protect, async (req, res) => {
+// @route   PATCH /api/appointments/:id/status
+// @desc    Update appointment status (business owner/admin only)
+// @access  Private
+router.patch('/:id/status', protect, async (req, res) => {
   try {
-    const appointment = await Appointment.findById(req.params.id);
+    const { status } = req.body;
+    const validStatuses = ['pending', 'confirmed', 'completed', 'cancelled'];
 
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ message: 'Invalid status' });
+    }
+
+    const appointment = await Appointment.findById(req.params.id);
     if (!appointment) {
       return res.status(404).json({ message: 'Appointment not found' });
     }
 
-    // Only customer who made it or business owner can cancel
-    const isCustomer = appointment.customer.toString() === req.user._id.toString();
-    const business = await Business.findOne({ _id: appointment.business, owner: req.user._id });
-    const isBusinessOwner = !!business;
+    // Check if user is business owner or admin
+    const business = await Business.findById(appointment.business);
+    const isOwner = business.owner.toString() === req.user._id.toString();
+    const isAdmin = req.user.role === 'admin';
 
-    if (!isCustomer && !isBusinessOwner && req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Access denied' });
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to update this appointment' });
+    }
+
+    appointment.status = status;
+    await appointment.save();
+
+    await appointment.populate('service business customer');
+
+    res.json({
+      success: true,
+      message: 'Appointment status updated',
+      appointment
+    });
+  } catch (error) {
+    console.error('Error updating appointment status:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// @route   PATCH /api/appointments/:id/cancel
+// @desc    Cancel appointment (customer or business owner)
+// @access  Private
+router.patch('/:id/cancel', protect, async (req, res) => {
+  try {
+    const appointment = await Appointment.findById(req.params.id);
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' });
+    }
+
+    // Check authorization
+    const isCustomer = appointment.customer.toString() === req.user._id.toString();
+    const business = await Business.findById(appointment.business);
+    const isOwner = business.owner.toString() === req.user._id.toString();
+
+    if (!isCustomer && !isOwner) {
+      return res.status(403).json({ message: 'Not authorized to cancel this appointment' });
     }
 
     if (appointment.status === 'completed') {
@@ -251,12 +352,16 @@ router.patch('/:id/cancel', protect, async (req, res) => {
     appointment.status = 'cancelled';
     await appointment.save();
 
+    await appointment.populate('service business customer');
+
     res.json({
-      message: 'Appointment cancelled successfully',
+      success: true,
+      message: 'Appointment cancelled',
       appointment
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error cancelling appointment:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
 
