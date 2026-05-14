@@ -1,50 +1,81 @@
 const express = require('express');
-const dotenv = require('dotenv');
+const mongoose = require('mongoose');
 const cors = require('cors');
-const connectDB = require('./config/db');
-const businessRoutes = require('./routes/businessRoutes');
-const serviceRoutes = require('./routes/serviceRoutes');
-const appointmentRoutes = require('./routes/appointmentRoutes');
-
-dotenv.config();
-connectDB();
+require('dotenv').config();
 
 const app = express();
 
-app.use(cors({
-  origin: 'http://localhost:3001', // React default port
-  credentials: true
-}));
-app.use(express.json());
-app.use('/api/businesses', businessRoutes);
-app.use('/api/services', serviceRoutes);
-app.use('/api/appointments', appointmentRoutes);
+// Trust proxy (for Render)
+app.set('trust proxy', 1);
 
+// CORS
+const allowedOrigins = [
+  'http://localhost:3001',
+  'http://localhost:3000',
+  process.env.CLIENT_URL
+].filter(Boolean);
+
+app.use(cors({
+  origin: function(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Body parser
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Request logging (only in development)
+if (process.env.NODE_ENV === 'development') {
+  app.use((req, res, next) => {
+    console.log(`${req.method} ${req.path}`);
+    next();
+  });
+}
+
+// Database connection
+const connectDB = require('./config/db');
+connectDB();
 
 // Routes
-const authRoutes = require('./routes/authRoutes');
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/businesses', require('./routes/businessRoutes'));
+app.use('/api/services', require('./routes/serviceRoutes'));
+app.use('/api/appointments', require('./routes/appointmentRoutes'));
 
-// Middleware
-const { protect, restrictTo } = require('./middleware/authMiddleware');
-
-// Protected routes (test routes)
-app.get('/api/profile', protect, (req, res) => {
+// Health check
+app.get('/api/health', (req, res) => {
   res.json({ 
-    message: 'This is your profile', 
-    user: req.user 
+    status: 'OK', 
+    message: 'SlotEase API is running',
+    environment: process.env.NODE_ENV 
   });
 });
 
-app.get('/api/admin', protect, restrictTo('admin'), (req, res) => {
-  res.json({ message: 'Welcome admin!' });
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ message: 'Route not found' });
 });
 
-app.get('/', (req, res) => {
-  res.json({ message: 'SlotEase API is running' });
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(500).json({ 
+    message: 'Something went wrong!',
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
 });
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
 });
